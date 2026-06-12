@@ -1,0 +1,387 @@
+#!/usr/bin/env python3
+"""
+pan_tilt_node.py  –  ROS2 node for a 2-DOF pan/tilt platform
+                     using Feetech STS3215 servos on a USB serial bus.
+
+Protocol: SMS/STS half-duplex UART, 1 Mbps default
+Servo IDs: pan = 1, tilt = 2  (remappable via parameters)
+
+Published topics:
+  ~/joint_states  (sensor_msgs/JointState)
+
+Subscribed topics:
+  ~/pan_tilt_cmd  (geometry_msgs/Vector3)  x=pan_deg, y=tilt_deg, z=speed (0-use default)
+  ~/joint_cmd     (sensor_msgs/JointState) name+position (rad) generic interface
+
+Services:
+  ~/torque_enable (std_srvs/SetBool)
+  ~/go_home       (std_srvs/Trigger)
+
+Parameters:
+  serial_port      (string, required via arg)
+  baud_rate        (int,    default 1000000)
+  pan_id           (int,    default 1)
+  tilt_id          (int,    default 2)
+  pan_min_deg      (float,  default -135.0)
+  pan_max_deg      (float,  default  135.0)
+  tilt_min_deg     (float,  default  -90.0)
+  tilt_max_deg     (float,  default   45.0)
+  default_speed    (int,    default 500)   # STS raw units 0-3000
+  feedback_hz      (float,  default  20.0)
+"""
+
+import math
+import struct
+import time
+import threading
+import serial
+import rclpy
+from rclpy.node import Node
+from rclpy.parameter import Parameter
+from sensor_msgs.msg import JointState
+from geometry_msgs.msg import Vector3
+from std_srvs.srv import SetBool, Trigger
+
+# ──────────────────────────────────────────────────────────────────────────────
+# STS / SMS low-level register map (STS3215 datasheet)
+# ──────────────────────────────────────────────────────────────────────────────
+REG_TORQUE_ENABLE   = 0x28   # 1 byte
+REG_GOAL_POSITION   = 0x2A   # 2 bytes  (0-4095)
+REG_GOAL_SPEED      = 0x2C   # 2 bytes
+REG_PRESENT_POSITION= 0x38   # 2 bytes
+REG_PRESENT_SPEED   = 0x3A   # 2 bytes
+REG_PRESENT_LOAD    = 0x3C   # 2 bytes
+REG_PRESENT_VOLTAGE = 0x3E   # 1 byte
+REG_PRESENT_TEMP    = 0x3F   # 1 byte
+REG_MOVING          = 0x42   # 1 byte
+
+# Protocol constants
+HEADER              = 0xFF
+INST_WRITE          = 0x03
+INST_READ           = 0x02
+INST_SYNC_WRITE     = 0x83
+BROADCAST_ID        = 0xFE
+
+# STS3215 position full range → 0..4095 maps to 0..360 deg
+# Center = 2048 ≈ 180 deg  →  offset so center = 0 deg
+TICKS_PER_DEG       = 4096.0 / 360.0
+CENTER_TICK         = 2048
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Serial bus helper (no external SDK needed)
+# ──────────────────────────────────────────────────────────────────────────────
+class STSBus:
+    """
+    Minimal Feetech STS/SMS protocol driver.
+    Half-duplex: we own the bus exclusively; TX then wait for RX.
+    """
+
+    def __init__(self, port: str, baud: int = 1_000_000, timeout: float = 0.05):
+        self._lock = threading.Lock()
+        self._ser  = serial.Serial(
+            port,
+            baudrate=baud,
+            bytesize=serial.EIGHTBITS,
+            parity=serial.PARITY_NONE,
+            stopbits=serial.STOPBITS_ONE,
+            timeout=timeout,
+        )
+        # Flush any garbage
+        self._ser.reset_input_buffer()
+        self._ser.reset_output_buffer()
+
+    def close(self):
+        self._ser.close()
+
+    # ── packet builders ───────────────────────────────────────────────────────
+
+    @staticmethod
+    def _checksum(servo_id: int, length: int, instruction: int, params: bytes) -> int:
+        total = servo_id + length + instruction + sum(params)
+        return (~total) & 0xFF
+
+    @staticmethod
+    def _build_packet(servo_id: int, instruction: int, params: bytes) -> bytes:
+        length = len(params) + 2   # params + instruction + checksum
+        cs     = STSBus._checksum(servo_id, length, instruction, params)
+        return bytes([HEADER, HEADER, servo_id, length, instruction]) + params + bytes([cs])
+
+    # ── public API ────────────────────────────────────────────────────────────
+
+    def write_byte(self, servo_id: int, reg: int, value: int):
+        params = bytes([reg, value & 0xFF])
+        pkt = self._build_packet(servo_id, INST_WRITE, params)
+        with self._lock:
+            self._ser.write(pkt)
+            self._ser.flush()
+            # read & discard status packet
+            self._read_status(servo_id)
+
+    def write_word(self, servo_id: int, reg: int, value: int):
+        """Write 2-byte little-endian word."""
+        lo = value & 0xFF
+        hi = (value >> 8) & 0xFF
+        params = bytes([reg, lo, hi])
+        pkt = self._build_packet(servo_id, INST_WRITE, params)
+        with self._lock:
+            self._ser.write(pkt)
+            self._ser.flush()
+            self._read_status(servo_id)
+
+    def read_bytes(self, servo_id: int, reg: int, length: int) -> bytes | None:
+        params = bytes([reg, length])
+        pkt = self._build_packet(servo_id, INST_READ, params)
+        with self._lock:
+            self._ser.write(pkt)
+            self._ser.flush()
+            return self._read_status(servo_id, expected_params=length)
+
+    def sync_write_positions(self, servos: list[tuple[int, int, int]]):
+        """
+        servos: list of (servo_id, position_tick, speed_raw)
+        Uses SYNC_WRITE to command all servos in one packet.
+        """
+        data_len = 4   # 2 bytes pos + 2 bytes speed per servo
+        params   = bytes([REG_GOAL_POSITION, data_len])
+        for sid, pos, spd in servos:
+            pos = max(0, min(4095, pos))
+            spd = max(0, min(3000, spd))
+            params += bytes([
+                sid,
+                pos & 0xFF, (pos >> 8) & 0xFF,
+                spd & 0xFF, (spd >> 8) & 0xFF,
+            ])
+        pkt = self._build_packet(BROADCAST_ID, INST_SYNC_WRITE, params)
+        with self._lock:
+            self._ser.write(pkt)
+            self._ser.flush()
+            # Sync write has no status response
+
+    # ── internal ─────────────────────────────────────────────────────────────
+
+    def _read_status(self, servo_id: int, expected_params: int = 0) -> bytes | None:
+        """
+        Read a status packet: FF FF ID LEN ERR [PARAMS] CHECKSUM
+        Returns param bytes or None on timeout/error.
+        """
+        # Header
+        hdr = self._ser.read(2)
+        if len(hdr) < 2 or hdr[0] != HEADER or hdr[1] != HEADER:
+            self._ser.reset_input_buffer()
+            return None
+        meta = self._ser.read(3)   # ID LEN ERR
+        if len(meta) < 3:
+            return None
+        sid, length, err = meta
+        n_params = length - 2      # length field includes ERR + CHECKSUM
+        if n_params < 0:
+            return None
+        body = self._ser.read(n_params + 1)   # params + checksum
+        if len(body) < n_params + 1:
+            return None
+        params   = body[:n_params]
+        received_cs = body[n_params]
+        expected_cs = self._checksum(sid, length, 0x00, bytes([err]) + params)
+        if received_cs != expected_cs:
+            return None
+        if err:
+            return None
+        return params if params else b'\x00'
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Unit helpers
+# ──────────────────────────────────────────────────────────────────────────────
+
+def deg_to_tick(deg: float) -> int:
+    return int(round(CENTER_TICK + deg * TICKS_PER_DEG))
+
+def tick_to_deg(tick: int) -> float:
+    return (tick - CENTER_TICK) / TICKS_PER_DEG
+
+def deg_to_rad(deg: float) -> float:
+    return deg * math.pi / 180.0
+
+def rad_to_deg(rad: float) -> float:
+    return rad * 180.0 / math.pi
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# ROS2 Node
+# ──────────────────────────────────────────────────────────────────────────────
+
+class PanTiltNode(Node):
+
+    def __init__(self):
+        super().__init__('pan_tilt_node')
+
+        # ── declare parameters ────────────────────────────────────────────────
+        self.declare_parameter('serial_port',   '/dev/ttyUSB0')
+        self.declare_parameter('baud_rate',     1_000_000)
+        self.declare_parameter('pan_id',        1)
+        self.declare_parameter('tilt_id',       2)
+        self.declare_parameter('pan_min_deg',  -135.0)
+        self.declare_parameter('pan_max_deg',   135.0)
+        self.declare_parameter('tilt_min_deg',  -90.0)
+        self.declare_parameter('tilt_max_deg',   45.0)
+        self.declare_parameter('default_speed',  500)
+        self.declare_parameter('feedback_hz',    20.0)
+
+        port      = self.get_parameter('serial_port').value
+        baud      = self.get_parameter('baud_rate').value
+        self._pan_id   = self.get_parameter('pan_id').value
+        self._tilt_id  = self.get_parameter('tilt_id').value
+        self._pan_min  = self.get_parameter('pan_min_deg').value
+        self._pan_max  = self.get_parameter('pan_max_deg').value
+        self._tilt_min = self.get_parameter('tilt_min_deg').value
+        self._tilt_max = self.get_parameter('tilt_max_deg').value
+        self._def_spd  = self.get_parameter('default_speed').value
+        fb_hz          = self.get_parameter('feedback_hz').value
+
+        # ── open bus ──────────────────────────────────────────────────────────
+        self.get_logger().info(f'Opening STS bus on {port} @ {baud} baud')
+        try:
+            self._bus = STSBus(port, baud)
+        except serial.SerialException as e:
+            self.get_logger().fatal(f'Cannot open serial port: {e}')
+            raise SystemExit(1)
+
+        # Enable torque on both servos at startup
+        self._set_torque(True)
+        self.get_logger().info(
+            f'Pan/tilt ready  pan_id={self._pan_id}  tilt_id={self._tilt_id}')
+
+        # ── publishers ────────────────────────────────────────────────────────
+        self._js_pub = self.create_publisher(JointState, '~/joint_states', 10)
+
+        # ── subscribers ───────────────────────────────────────────────────────
+        self.create_subscription(
+            Vector3, '~/pan_tilt_cmd', self._cmd_cb, 10)
+        self.create_subscription(
+            JointState, '~/joint_cmd', self._joint_cmd_cb, 10)
+
+        # ── services ─────────────────────────────────────────────────────────
+        self.create_service(SetBool,  '~/torque_enable', self._torque_srv)
+        self.create_service(Trigger,  '~/go_home',       self._home_srv)
+
+        # ── feedback timer ────────────────────────────────────────────────────
+        self.create_timer(1.0 / fb_hz, self._feedback_cb)
+
+        # ── state ─────────────────────────────────────────────────────────────
+        self._pan_deg  = 0.0
+        self._tilt_deg = 0.0
+
+    # ── cleanup ───────────────────────────────────────────────────────────────
+
+    def destroy_node(self):
+        self._set_torque(False)
+        self._bus.close()
+        super().destroy_node()
+
+    # ── internal helpers ──────────────────────────────────────────────────────
+
+    def _clamp_pan(self, deg: float) -> float:
+        return max(self._pan_min, min(self._pan_max, deg))
+
+    def _clamp_tilt(self, deg: float) -> float:
+        return max(self._tilt_min, min(self._tilt_max, deg))
+
+    def _move(self, pan_deg: float, tilt_deg: float, speed: int = 0):
+        pan_deg  = self._clamp_pan(pan_deg)
+        tilt_deg = self._clamp_tilt(tilt_deg)
+        spd = speed if speed > 0 else self._def_spd
+        self._bus.sync_write_positions([
+            (self._pan_id,  deg_to_tick(pan_deg),  spd),
+            (self._tilt_id, deg_to_tick(tilt_deg), spd),
+        ])
+        self._pan_deg  = pan_deg
+        self._tilt_deg = tilt_deg
+
+    def _set_torque(self, enable: bool):
+        val = 1 if enable else 0
+        self._bus.write_byte(self._pan_id,  REG_TORQUE_ENABLE, val)
+        self._bus.write_byte(self._tilt_id, REG_TORQUE_ENABLE, val)
+
+    def _read_position(self, servo_id: int) -> float | None:
+        data = self._bus.read_bytes(servo_id, REG_PRESENT_POSITION, 2)
+        if data and len(data) >= 2:
+            tick = data[0] | (data[1] << 8)
+            return tick_to_deg(tick)
+        return None
+
+    # ── callbacks ─────────────────────────────────────────────────────────────
+
+    def _cmd_cb(self, msg: Vector3):
+        """
+        geometry_msgs/Vector3:
+          x = pan  degrees
+          y = tilt degrees
+          z = speed raw (0 = use default)
+        """
+        self._move(msg.x, msg.y, int(msg.z))
+
+    def _joint_cmd_cb(self, msg: JointState):
+        """
+        Accept JointState with names 'pan' / 'tilt' (positions in radians).
+        """
+        pan_deg  = self._pan_deg
+        tilt_deg = self._tilt_deg
+        speed    = self._def_spd
+
+        for i, name in enumerate(msg.name):
+            if i < len(msg.position):
+                deg = rad_to_deg(msg.position[i])
+                if name == 'pan':
+                    pan_deg = deg
+                elif name == 'tilt':
+                    tilt_deg = deg
+
+        self._move(pan_deg, tilt_deg, speed)
+
+    def _feedback_cb(self):
+        pan_deg  = self._read_position(self._pan_id)
+        tilt_deg = self._read_position(self._tilt_id)
+
+        if pan_deg  is None: pan_deg  = self._pan_deg
+        if tilt_deg is None: tilt_deg = self._tilt_deg
+
+        js = JointState()
+        js.header.stamp = self.get_clock().now().to_msg()
+        js.name     = ['pan', 'tilt']
+        js.position = [deg_to_rad(pan_deg), deg_to_rad(tilt_deg)]
+        self._js_pub.publish(js)
+
+    # ── service handlers ──────────────────────────────────────────────────────
+
+    def _torque_srv(self, request: SetBool.Request, response: SetBool.Response):
+        self._set_torque(request.data)
+        response.success = True
+        response.message = 'torque enabled' if request.data else 'torque disabled'
+        return response
+
+    def _home_srv(self, request: Trigger.Request, response: Trigger.Response):
+        self._move(0.0, 0.0)
+        response.success = True
+        response.message = 'homing to 0,0'
+        return response
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Entry point
+# ──────────────────────────────────────────────────────────────────────────────
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = PanTiltNode()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()

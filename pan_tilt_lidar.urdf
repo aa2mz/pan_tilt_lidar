@@ -1,0 +1,33 @@
+<?xml version="1.0"?>
+<robot name="pan_tilt_lidar">
+
+  <link name="base_link" />
+
+  <link name="pan_link" />
+  <joint name="pan" type="revolute">
+    <parent link="base_link"/>
+    <child link="pan_link"/>
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-2.356" upper="2.356" effort="1.0" velocity="1.0"/>
+  </joint>
+
+  <link name="tilt_link" />
+  <joint name="tilt" type="revolute">
+    <parent link="pan_link"/>
+    <child link="tilt_link"/>
+    <origin xyz="0 0 0.078" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-1.570" upper="0.785" effort="1.0" velocity="1.0"/>
+  </joint>
+
+  <!-- lidar beam exit is 50 mm above the tilt axis:
+       25 mm tilt arm + 25 mm to the beam, coaxial / straight up -->
+  <link name="base_laser" />
+  <joint name="lidar_joint" type="fixed">
+    <parent link="tilt_link"/>
+    <child link="base_laser"/>
+    <origin xyz="0 0 0.050" rpy="0 0 0"/>
+  </joint>
+
+</robot>
