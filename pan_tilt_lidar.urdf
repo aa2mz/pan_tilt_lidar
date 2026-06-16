@@ -17,7 +17,7 @@
     <parent link="pan_link"/>
     <child link="tilt_link"/>
     <origin xyz="0 0 0.078" rpy="0 0 0"/>
-    <axis xyz="0 1 0"/>
+    <axis xyz="0 -1 0"/>
     <limit lower="-1.570" upper="0.785" effort="1.0" velocity="1.0"/>
   </joint>
 

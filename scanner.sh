@@ -21,23 +21,28 @@ URDF=$MAP_DIR/pan_tilt_lidar.urdf
 
 # ── log management ────────────────────────────────────────────────────────────
 # Send ROS 2 logs to tmpfs so they never fill the SD card and clear on reboot.
-# /tmp is RAM-backed on most installs; prune anything left from a prior boot.
 export ROS_LOG_DIR=/tmp/roslog
 mkdir -p "$ROS_LOG_DIR"
-# keep only the last hour of run-dirs to bound RAM use during long sessions
 find "$ROS_LOG_DIR" -maxdepth 1 -type d -mmin +60 -exec rm -rf {} + 2>/dev/null
 
 echo "=== scanner startup ==="
 echo "  lidar : $LIDAR_PORT"
 echo "  servo : $SERVO_PORT"
 echo "  rover : $ROVER_IP"
+echo "  urdf  : $URDF"
 echo "  logs  : $ROS_LOG_DIR (tmpfs, auto-pruned)"
 echo "======================="
+
+if [ ! -f "$URDF" ]; then
+    echo "ERROR: URDF not found at $URDF"
+    exit 1
+fi
 
 source /opt/ros/jazzy/setup.bash
 source /home/ed/ros2_ws/install/setup.bash
 
 PIDS=()
+TMPFILES=()
 
 cleanup() {
     echo ""
@@ -46,6 +51,9 @@ cleanup() {
         kill "$pid" 2>/dev/null
     done
     wait 2>/dev/null
+    for f in "${TMPFILES[@]}"; do
+        rm -f "$f" 2>/dev/null
+    done
     echo "done."
 }
 trap cleanup EXIT INT TERM
@@ -57,13 +65,25 @@ PIDS+=($!)
 sleep 1
 
 # ── robot_state_publisher ─────────────────────────────────────────────────────
+# Load the URDF via a YAML params file, NOT a -p command-line override.
+# Passing multi-line XML (especially with comments) through -p breaks the rcl
+# argument parser. A params file carries the XML as a literal block scalar.
 echo "[2/7] robot_state_publisher"
+RSP_PARAMS=$(mktemp /tmp/rsp_params.XXXXXX.yaml)
+TMPFILES+=("$RSP_PARAMS")
+{
+    echo "robot_state_publisher:"
+    echo "  ros__parameters:"
+    echo "    robot_description: |"
+    sed 's/^/      /' "$URDF"      # indent each URDF line under the block scalar
+} > "$RSP_PARAMS"
 ros2 run robot_state_publisher robot_state_publisher \
-    --ros-args -p robot_description:="$(cat $URDF)" &
+    --ros-args --params-file "$RSP_PARAMS" &
 PIDS+=($!)
 sleep 1
 
 # ── ldlidar ───────────────────────────────────────────────────────────────────
+# laser_scan_dir:=false  -> correct (un-mirrored) left/right sweep
 echo "[3/7] ldlidar on $LIDAR_PORT"
 ros2 run ldlidar_stl_ros2 ldlidar_stl_ros2_node \
     --ros-args \
@@ -101,7 +121,7 @@ ROVERMQTT=$ROVER_IP python3 $MAP_DIR/scan_mqtt_bridge.py &
 PIDS+=($!)
 sleep 1
 
-# ── rviz2 (skip when headless: set HEADLESS=1) ────────────────────────────────
+# ── rviz2 (skip when headless: set HEADLESS=1 or no DISPLAY) ───────────────────
 if [ "${HEADLESS:-0}" = "1" ] || [ -z "${DISPLAY:-}" ]; then
     echo "[7/7] rviz2 — SKIPPED (headless)"
 else
